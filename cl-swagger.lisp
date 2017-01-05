@@ -12,6 +12,7 @@
       (200 (cl-json:decode-json body)))))
 
 (defun get-in (items alist)
+  "Calls assoc on alist for each thing in items. Returns the cdr of that"
   (if (endp items) alist
       (get-in (rest items)
               (cdr (assoc (car items) alist)))))
@@ -20,31 +21,9 @@
 (defparameter *test-path* (assoc :/search/series (cdr (assoc :paths *test-doc*))))
 (defparameter *test-def* (assoc :*token (cdr (assoc :definitions *test-doc*))))
 
-(defstruct swagger
-  version
-  info
-  host
-  base-path
-  schemes
-  consumes
-  produces
-  paths
-  definitions
-  parameters
-  responses
-  security-definitions
-  security
-  tags)
-
 (defclass swagger-object ()
   ()
   (:documentation "Base class for swagger objects"))
-
-(defmacro alist-value (item alist)
-  `(cdr (assoc ,item ,alist :test #'string=)))
-
-(defun normalize-path-name (name)
-  (string-upcase name))
 
 (defun uncamelize (x)
   "returns a new string with uppercase chars converted to -<lower case char>"
@@ -62,6 +41,26 @@
                (vector-push-extend c o))
         finally (return (string-upcase o))))
 
+(defparameter *test-path-parameter* "/foo/{item}/{bar}")
+
+(defun parse-path-parameters (path)
+  "returns two values, first is non param path element, second are the params"
+  (values-list (mapcar #'nreverse
+                       (reduce
+                        (lambda (acc v)
+                          (if (string= "" v)
+                              acc
+                              (let ((param (cl-ppcre:register-groups-bind (param)
+                                               (*parameter-pattern* v) param)))
+                                (if param
+                                    (list (first acc) (push param (second acc)))
+                                    (list (push v (first acc)) (second acc))))))
+                        (cl-ppcre:split "/" (string path))
+                        :initial-value (list nil nil)))))
+
+(defun normalize-path-name (name)
+  (string-upcase (format nil "~{~A~^-~}" (parse-path-parameters name))))
+
 (defun trim-string (prefix s)
   (subseq s (length prefix)))
 
@@ -69,16 +68,37 @@
   (declare (ignore root))
   (mapcar (lambda (x)
             (intern
-             (cl-json:simplified-camel-case-to-lisp (trim-string "#/parameters/" (cdr (assoc :$ref x))))))
+             (simplified-camel-case-to-lisp
+              (car (last (cl-ppcre:split "/" (if-let ((ref (get-in '(:$ref) x)))
+                                               ref
+                                               (get-in '(:schema :$ref) x))))))))
           params))
 
-(defun gen-url (root path)
-  `(format nil "~A://~A/~A/~A"
-           ,(or (cdr (assoc :scheme (cdr path)))
-                (cadr (assoc :schemes root)))
-           *api-host*
-           ,(cdr (assoc :base-path root))
-           ,(string-downcase (car path))))
+(defparameter *parameter-pattern* "{([A-Z\-]+)}")
+
+(defun path-parameters (path)
+  (let (result)
+    (cl-ppcre:do-register-groups (param) (*parameter-pattern* path)
+      (push param result))
+    (nreverse result)))
+
+(defun gen-url (root path verb)
+  (multiple-value-bind (path-elements param-elements)
+      (parse-path-parameters  path)
+    (let* ((scheme (or (cdr (assoc :scheme (cdr verb)))
+                       (cadr (assoc :schemes root))))
+           (base-path (get-in '(:base-path) root))
+           (fmt-params (nconc path-elements (mapcar (lambda (x)
+                                                      (declare (ignore x))
+                                                      "~A")
+                                                    param-elements))))
+      `(format nil
+               ,(if (string= "/" base-path)
+                    (format nil "~A://~~A/~{~A/~}" scheme fmt-params)
+                    (format nil "~A://~~A/~A/~{~A/~}" scheme
+                            base-path fmt-params))
+               *api-host*
+               ,@(mapcar #'intern param-elements)))))
 
 (defvar *jwt-token* nil)
 
@@ -90,36 +110,36 @@
           root))
 
 (defun gen-http-headers (root path-method)
-  (let ((headers '()))
+  (let (headers)
     ;; TODO: handle different security thingies
     (let* ((sec (caaar (get-in '(:security) path-method)))
            (sec-defs (get-in (list :security-definitions sec) root)))
         (when (string= "header" (get-in '(:in) sec-defs))
-          (setf headers `(acons "Authorization" (format nil "Bearer ~A" *jwt-token*) nil)))
+          (setf headers `(acons "Authorization" (format nil "Bearer ~A" *jwt-token*) nil))))
     ;; go through each parameter and see if any are headers
-    (loop for ((key . val)) in (get-in '(:parameters) path-method)
-          do (let ((param (if (string= "$REF" key)
-                              (resolve-reference root val)
-                              val)))
-               (when (string= "header" (get-in '(:in) param))
-                 (setf headers  `(acons ,(get-in '(:name) param)
-                                        ,(intern (cl-json:simplified-camel-case-to-lisp
-                                                  (get-in '(:name) param)))
-                                        ,headers))))))
+    (dolist (p (get-in '(:parameters) path-method))
+      (let ((param (if-let (resolved (resolve-reference root (get-in '(:$ref) p)))
+                     resolved
+                     p)))
+        (if (string= "header" (get-in '(:in) param))
+            (setf headers `(acons ,(get-in '(:name) param)
+                                  ,(intern (simplified-camel-case-to-lisp
+                                            (get-in '(:name) param)))
+                                  ,headers)))))
     headers))
 
 (defun gen-http-params (root path)
-  (loop for ((key . val)) in (get-in '(:parameters) path)
-        with x = nil
-        do (let ((param (if (string= "$REF" key)
-                            (resolve-reference root val)
-                            val)))
-             (when (string= "query" (get-in '(:in) param))
-               (setf x `(acons ,(get-in '(:name) param)
-                               ,(intern (cl-json:simplified-camel-case-to-lisp
-                                         (get-in '(:name) param)))
-                               ,x))))
-        finally (return x)))
+  (let (result)
+    (dolist (p (get-in '(:parameters) path))
+      (let ((param (if-let (resolved (resolve-reference root (get-in '(:$ref) p)))
+                     resolved
+                     p)))
+        (if (string= "query" (get-in '(:in) param))
+            (setf result `(acons ,(get-in '(:name) param)
+                                        ,(intern (simplified-camel-case-to-lisp
+                                                  (get-in '(:name) param)))
+                                        ,result)))))
+    result))
 
 (defun gen-http-options (root path)
   `(:parameters ,(gen-http-params root path)
@@ -132,8 +152,11 @@
                             (string x))))
 
 (defun make-response (root value)
-  (declare (ignore root value))
-  :placeholder)
+  (declare (ignore root))
+  (let ((model-name (car (last (cl-ppcre:split "/" (get-in '(:schema :$ref) value))))) )
+    (if model-name
+        `(make-instance ',(intern (simplified-camel-case-to-lisp model-name)))
+        t)))
 
 (defun make-struct-name (keyword)
   (subseq (string keyword) 1))
@@ -142,18 +165,18 @@
   (intern (uncamelize (string-downcase (string x)))))
 
 (defun strip-star (x)
-  (remove-if (lambda (x) (equal #\* x)) x))
+  (remove-if (curry #'equal #\*) x))
 
 (defun gen-slot (root class-name prop)
   (declare (ignore root))
   (let* ((sym-name (to-symbol (strip-star (string (car prop))))))
     `(,sym-name
       :initarg ,(intern (string sym-name) "KEYWORD")
-      ,@(list :type (alexandria:switch ((get-in '(:type) (cdr prop)) :test #'equal)
+      ,@(list :type (switch ((get-in '(:type) (cdr prop)) :test #'equal)
            ("string" 'string)
            ("integer" 'integer)
            ("object" 'swagger-object)))
-      ,@(alexandria:if-let ((default (get-in '(:default) (cdr prop))))
+      ,@(if-let ((default (get-in '(:default) (cdr prop))))
          `(:initform ,default))
       :accessor ,(intern (format nil "~A-~A" class-name (strip-star (string (car prop))))))))
 
@@ -166,6 +189,9 @@
 (define-condition unhandled-response-code-error (error)
   ((response-code :initarg :response-code)))
 
+(define-condition unknown-response-content-type-error (error)
+  ((content-type :initarg :content-type)))
+
 (defmacro sformat (fmt &rest rest)
   `(format nil ,fmt ,@rest))
 
@@ -177,27 +203,53 @@
         ("string" '(what :initarg :what)))))
 
 (defun gen-all-definitions (root)
-  (loop for defn in (get-in '(:definitions) root)
-        with out = '()
-        do (if (equal :+JSON+-ERRORS (car defn))
-               (loop for error in (get-in '(:properties) (cdr defn))
-                     do (setf out (cons (gen-error error) out)))
-               (setf out (cons (gen-definiton root defn) out)))
-        finally (return out)))
+  (let (out)
+    (loop for defn in (get-in '(:definitions) root)
+          do (if (equal :+JSON+-ERRORS (car defn))
+                 (loop for error in (get-in '(:properties) (cdr defn))
+                       do (push (gen-error error) out))
+                 (push (gen-definiton root defn) out)))))
 
-(defun gen-path-func (root path)
-  `(defun ,(intern (normalize-path-name (car path)))
-       ,(gen-parameters  root (get-in '(:get :parameters) (cdr path)))
-     (with-multiple-value-bind (stream response-code headers)
-       (http-request ,(gen-url root path) ,@(gen-http-options root (cdr (assoc :get (cdr path)))))
-       (declare (ignore headers))
-       (setf (flex:flexi-stream-external-format stream) :utf-8)
-       (case response-code
-         ,@(loop for (resp . data) in (get-in '(:get :responses) (cdr path))
-                 collect (progn
-                           `(,(sym-to-integer resp)
-                             (make-response root val))))
-         otherwise
-         (error 'unhandled-response-code-error :text "Invalid response code"
-          :response-code response-code)))))
-;;; "cl-swagger" goes here. Hacks and glory await!
+(defun gen-all-paths (root)
+  (mapcan (lambda (path)
+            (mapcar (lambda (verb)
+                      (gen-path-func root (car path) verb))
+                    (cdr path)))
+          (cdr (assoc :paths root))))
+
+(defun gen-path-func (root path verb)
+  `(defun ,(intern (format nil "~A-~A" (normalize-path-name path) (car verb)))
+       ,(gen-parameters  root (get-in '(:parameters) (cdr verb)))
+     ,(get-in '(:description) (cdr verb))
+       (with-multiple-value-bind (stream response-code headers)
+         (http-request ,(gen-url root path verb) ,@(gen-http-options root (cdr verb))
+                       :method ,(car verb))
+         (setf (flex:flexi-stream-external-format stream) :utf-8)
+         (unless (string= (get-in '("Content-Type") headers)
+                          "application/json")
+           (error 'unknown-response-content-type-error
+                  :content-type (get-in '("Content-Type") headers)))
+         (let ((json (cl-json:decode-json stream)))
+           (case response-code
+             ,@(loop for (resp . data) in (get-in '(:responses) (cdr verb))
+                     collect (list (sym-to-integer resp) (make-response root data)))
+             otherwise
+             (error 'unhandled-response-code-error :text "Invalid response code"
+                                                   :response-code response-code))))))
+
+(define-condition package-not-found-error (error)
+  ((package :initarg :package)))
+
+(defmacro generate-client (package url)
+  (let ((json (fetch-json url))
+        (old-package (package-name *package*)))
+    (unless old-package
+      (error 'package-not-found-error :package package))
+    (setf *package* (find-package package))
+    (unwind-protect
+         `(progn
+            (defvar *jwt-token* nil)
+            (defvar *api-host* nil)
+            ,@(gen-all-definitions json)))
+      (setf *package* (find-package old-package))))
+(export 'generate-client)

@@ -7,4 +7,4 @@
         #:alexandria
         #:drakma
         #:cl-json)
-  (:nicknames "swagger"))
+  (:nicknames #:swagger))
