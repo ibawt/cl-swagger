@@ -194,14 +194,15 @@
   (let* ((class-name (make-struct-name (car defn))))
    `(defclass ,(intern class-name) (swagger:swagger-object)
       ,(mapcar (lambda (x)
-                 (gen-slot root class-name x)) (get-in '(:properties) (cdr defn))))))
+                 (gen-slot root class-name x)) (get-in '(:properties) (cdr defn)))
+      ,@(if-let ((doc (get-in '(:description) (cdr defn))))
+        `(:documentation ,doc)))))
 
 (defmacro sformat (fmt &rest rest)
   `(format nil ,fmt ,@rest))
 
 (defun gen-error (defn)
   `(define-condition ,(intern (sformat "~A-ERROR" (string (car defn)))) (error)
-       ;; (:description ,(get-in '(:description) (cdr defn)))
      ,(eswitch ((get-in '(:type) (cdr defn)) :test #'equal)
         ("array" '((items :initarg :items)))
         ("string" '((what :initarg :what))))))
@@ -226,21 +227,21 @@
   `(defun ,(intern (format nil "~A-~A" (normalize-path-name path) (car verb)))
        ,(gen-parameters  root (get-in '(:parameters) (cdr verb)))
      ,(get-in '(:description) (cdr verb))
-       (with-multiple-value-bind (stream response-code headers)
+     (multiple-value-bind (body-stream response-code headers)
          (http-request ,(gen-url root path verb) ,@(gen-http-options root (cdr verb))
                        :method ,(car verb))
-         (setf (flex:flexi-stream-external-format stream) :utf-8)
-         (unless (string= (get-in '("Content-Type") headers)
-                          "application/json")
-           (error 'swagger:unknown-response-content-type-error
-                  :content-type (get-in '("Content-Type") headers)))
-         (let ((json (cl-json:decode-json stream)))
-           (case response-code
-             ,@(loop for (resp . data) in (get-in '(:responses) (cdr verb))
-                     collect (list (sym-to-integer resp) (make-response root data)))
-             otherwise
-             (error 'swagger:unhandled-response-code-error :text "Invalid response code"
-                                                   :response-code response-code))))))
+       (setf (flex:flexi-stream-external-format body-stream) :utf-8)
+       (unless (string= (get-in '("Content-Type") headers)
+                        "application/json")
+         (error 'swagger:unknown-response-content-type-error
+                :content-type (get-in '("Content-Type") headers)))
+       (let ((json (cl-json:decode-json body-stream)))
+         (case response-code
+           ,@(loop for (resp . data) in (get-in '(:responses) (cdr verb))
+                   collect (list (sym-to-integer resp) (make-response root data)))
+           (otherwise
+            (error 'swagger:unhandled-response-code-error :text "Invalid response code"
+                                                          :response-code response-code)))))))
 
 (define-condition package-not-found-error (error)
   ((package :initarg :package)))
