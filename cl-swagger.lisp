@@ -4,6 +4,19 @@
 
 (in-package #:cl-swagger)
 
+(define-condition unhandled-response-code-error (error)
+  ((response-code :initarg :response-code)))
+(export 'unhandled-response-code-error)
+
+(define-condition unknown-response-content-type-error (error)
+  ((content-type :initarg :content-type)))
+(export 'unknown-response-content-type-error)
+
+(defclass swagger-object ()
+  ()
+  (:documentation "Base class for swagger objects"))
+(export 'swagger-object)
+
 (defun fetch-json (url)
   (multiple-value-bind (body response-code)
       (drakma:http-request url :want-stream t)
@@ -21,9 +34,6 @@
 (defparameter *test-path* (assoc :/search/series (cdr (assoc :paths *test-doc*))))
 (defparameter *test-def* (assoc :*token (cdr (assoc :definitions *test-doc*))))
 
-(defclass swagger-object ()
-  ()
-  (:documentation "Base class for swagger objects"))
 
 (defun uncamelize (x)
   "returns a new string with uppercase chars converted to -<lower case char>"
@@ -182,25 +192,19 @@
 
 (defun gen-definiton (root defn)
   (let* ((class-name (make-struct-name (car defn))))
-   `(defclass ,(intern class-name) (swagger-object)
+   `(defclass ,(intern class-name) (swagger:swagger-object)
       ,(mapcar (lambda (x)
                  (gen-slot root class-name x)) (get-in '(:properties) (cdr defn))))))
-
-(define-condition unhandled-response-code-error (error)
-  ((response-code :initarg :response-code)))
-
-(define-condition unknown-response-content-type-error (error)
-  ((content-type :initarg :content-type)))
 
 (defmacro sformat (fmt &rest rest)
   `(format nil ,fmt ,@rest))
 
 (defun gen-error (defn)
-  `(define-condition ,(intern (sformat "~A-ERROR" (string (car defn))))
-       (:description ,(get-in '(:description) (cdr defn)))
+  `(define-condition ,(intern (sformat "~A-ERROR" (string (car defn)))) (error)
+       ;; (:description ,(get-in '(:description) (cdr defn)))
      ,(eswitch ((get-in '(:type) (cdr defn)) :test #'equal)
-        ("array" '(items :initarg :items))
-        ("string" '(what :initarg :what)))))
+        ("array" '((items :initarg :items)))
+        ("string" '((what :initarg :what))))))
 
 (defun gen-all-definitions (root)
   (let (out)
@@ -208,7 +212,8 @@
           do (if (equal :+JSON+-ERRORS (car defn))
                  (loop for error in (get-in '(:properties) (cdr defn))
                        do (push (gen-error error) out))
-                 (push (gen-definiton root defn) out)))))
+                 (push (gen-definiton root defn) out)))
+    out))
 
 (defun gen-all-paths (root)
   (mapcan (lambda (path)
@@ -227,14 +232,14 @@
          (setf (flex:flexi-stream-external-format stream) :utf-8)
          (unless (string= (get-in '("Content-Type") headers)
                           "application/json")
-           (error 'unknown-response-content-type-error
+           (error 'swagger:unknown-response-content-type-error
                   :content-type (get-in '("Content-Type") headers)))
          (let ((json (cl-json:decode-json stream)))
            (case response-code
              ,@(loop for (resp . data) in (get-in '(:responses) (cdr verb))
                      collect (list (sym-to-integer resp) (make-response root data)))
              otherwise
-             (error 'unhandled-response-code-error :text "Invalid response code"
+             (error 'swagger:unhandled-response-code-error :text "Invalid response code"
                                                    :response-code response-code))))))
 
 (define-condition package-not-found-error (error)
@@ -242,14 +247,17 @@
 
 (defmacro generate-client (package url)
   (let ((json (fetch-json url))
-        (old-package (package-name *package*)))
+        (old-package (package-name *package*))
+        out)
     (unless old-package
       (error 'package-not-found-error :package package))
     (setf *package* (find-package package))
     (unwind-protect
-         `(progn
-            (defvar *jwt-token* nil)
-            (defvar *api-host* nil)
-            ,@(gen-all-definitions json)))
-      (setf *package* (find-package old-package))))
+         (setf out `(progn
+                      (defvar *jwt-token* nil)
+                      (defvar *api-host* nil)
+                      ,@(gen-all-definitions json)
+                      ,@(gen-all-paths json))))
+    (setf *package* (find-package old-package))
+    out))
 (export 'generate-client)

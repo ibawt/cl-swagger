@@ -7,4 +7,9 @@
         #:alexandria
         #:drakma
         #:cl-json)
-  (:nicknames #:swagger))
+  (:nicknames #:swagger)
+  (:export
+   #:generate-client
+   #:swagger-object
+   #:unknown-response-content-type-error
+   #:unhandled-response-code-error))
