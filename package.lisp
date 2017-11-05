@@ -5,8 +5,7 @@
 (defpackage #:cl-swagger
   (:use #:cl
         #:alexandria
-        #:drakma
-        #:cl-json)
+        #:drakma)
   (:nicknames #:swagger)
   (:export
    #:generate-client
