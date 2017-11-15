@@ -62,6 +62,9 @@
   (:documentation "A condition that is raised when the content type doesn't match application/json"))
 (export 'unknown-response-content-type-error)
 
+(defvar *target-package* nil
+  "package to intern things into")
+
 (defclass swagger-object ()
   ()
   (:documentation "Base class for swagger objects"))
@@ -72,16 +75,16 @@
   (let ((cl-json:*json-identifier-name-to-lisp* #'identity))
     (cl-json:decode-json x)))
 
-(defun simplified-camel-case-to-lisp (x)
+(defmacro simplified-camel-case-to-lisp (x)
   "see the matching cl-json method"
-  (cl-json:simplified-camel-case-to-lisp x))
+  `(cl-json:simplified-camel-case-to-lisp ,x))
 
 (defun json->lisp (x &key (keyword))
   "json key to a more lispy name"
   (let ((name (simplified-camel-case-to-lisp (string x))))
     (if keyword
         (intern name :keyword)
-        (intern name))))
+        (intern name *target-package*))))
 
 (defun fetch-json (url)
   "grabs json from the http url"
@@ -92,21 +95,25 @@
       (200 (decode-json body)))))
 (export 'fetch-json)
 
-(defmethod get-in (items alist)
+(defun get-in (items alist)
   "Calls assoc on alist for each thing in items. Returns the cdr of that"
-  (reduce (lambda (acc x)
-            (cdr (assoc x acc)))
-          items :initial-value alist))
+  (loop for x in items
+        with l = alist
+        do (setf l (cdr (assoc x l)))
+        finally (return l)))
+
+(defmacro get-in2 (items alist)
+  (if (listp items)
+   (loop for x in items
+         with o = alist
+         do (setf o `(cdr (assoc ,x ,o)))
+         finally (return o))
+   `(cdr (assoc ,items ,alist))))
 
 (defun gen-parameters (root params)
   (declare (ignore root))
   (mapcar (lambda (x)
-            (json->lisp
-             (if-let (name (get-in '(:|name|) x))
-                name
-                (car (last (cl-ppcre:split "/" (if-let ((ref (get-in '(:$ref) x)))
-                                                 ref
-                                                 (get-in '(:schema :$ref) x))))))))
+            (json->lisp (get-in2 :|name| x)))
           params))
 
 (defun paramp (x)
@@ -122,113 +129,131 @@
 (defun path-parameters (path)
   "splits the / delimited path into params and constants,
    returns multiple values (constant path elements, parameter path elements)"
-  (let (path-elems params)
-    (loop :for e in (split-path path)
-          :do  (cond
-                 ((paramp e) (push (strip-braces e) params))
-                 (t (push e path-elems))))
-    (values (nreverse path-elems) (nreverse params))))
+  (loop :for e in (split-path path)
+        :if (paramp e) collect e into params
+          :else collect e into path-elems
+        finally (return (values path-elems params))))
 
 (defun split-path (p)
   "splits the path by / and removes empty entries"
-  (remove-if #'emptyp (cl-ppcre:split "\\/" p)))
+  (split-sequence:split-sequence #\/ p :remove-empty-subseqs t))
 
 (defun gen-url (root path verb)
   "generates the url for the path and verb"
-  (let ((param-elements
-          (nth-value 1 (path-parameters  (string path)))))
-    (let* ((scheme (or (cdr (assoc :|scheme| (cdr verb)))
-                       (cadr (assoc :|schemes| root))))
-           (base-path (get-in '(:|basePath|) root)))
-      `(format nil
-               ,(format nil "~A://~~A~A/~{~A~^/~}" scheme base-path
-                        (mapcar
-                         (lambda (x) (if (paramp x) "~A" x))
-                         (split-path (string path))))
-               (or *api-host* ,(get-in '(:|host|) root))
-               ,@(mapcar #'json->lisp param-elements)))))
+  (let ((param-elements (nth-value 1 (path-parameters  (string path))))
+        (scheme (or (cadr (assoc :|schemes| (cdr verb)))
+                    (cadr (assoc :|schemes| root))))
+        (base-path (or (get-in2 :|basePath| root)
+                       "")))
+    `(format nil
+             ,(format nil "~~A://~~A~A/~{~A~^/~}" base-path
+                      (mapcar
+                       (lambda (x) (if (paramp x) "~A" x))
+                       (split-path (string path))))
+             (or *api-scheme* ,scheme)
+             ,(if-let ((host (get-in2 :|host| root)))
+                `(or *api-host* ,host)
+                '*api-host*)
+             ,@(mapcar (lambda (x)
+                         (json->lisp (strip-braces x)))
+                       param-elements))))
 
 (defun resolve-reference (root path)
   ;; TODO: correctly handle the # part
   (get-in (mapcar (lambda (x)
-                    (intern (cl-json:camel-case-to-lisp x) "KEYWORD"))
+                    (intern x :keyword))
                   (cdr (cl-ppcre:split "/" path)))
           root))
 
 (defun gen-http-headers (root path-method)
+  "returns headers for path and method"
   (let (headers)
     ;; TODO: handle different security thingies
-    (let* ((sec (caaar (get-in '(:|security|) path-method)))
+    (let* ((sec (caaar (get-in2 :|security| path-method)))
            (sec-defs (get-in (list :|security-definitions| sec) root)))
         (when (string= "header" (get-in '(:|in|) sec-defs))
           (setf headers `(acons "Authorization" (format nil "Bearer ~A" *jwt-token*) nil))))
     ;; go through each parameter and see if any are headers
-    (dolist (p (get-in '(:|parameters|) path-method))
-      (let ((param (if-let (resolved (resolve-reference root (get-in '(:$ref) p)))
+    (dolist (p (get-in2 :|parameters| path-method))
+      (let ((param (if-let (resolved (resolve-reference root (get-in '(:|$ref|) p)))
                      resolved
                      p)))
-        (if (string= "header" (get-in '(:|in|) param))
-            (setf headers `(acons ,(get-in '(:|name|) param)
-                                  ,(json->lisp (get-in '(:|name|) param))
+        (if (string= "header" (get-in2 :|in| param))
+            (setf headers `(acons ,(get-in2 :|name| param)
+                                  ,(json->lisp (get-in2 :|name| param))
                                   ,headers)))))
     headers))
 
 (defun gen-http-params (root path)
+  "returns query params for path"
   (declare (ignore root))
-  (let (result)
-    (dolist (p (get-in '(:|parameters|) path))
-        (if (string= "query" (get-in '(:|in|) p))
-            (setf result `(acons ,(get-in '(:|name|) p)
-                                 ,(->param (get-in '(:|name|) p))
-                                 ,result))))
-    result))
+  (reduce (lambda (acc p)
+            (if (string= "query" (get-in2 :|in| p))
+                `(acons ,(get-in2 :|name| p)
+                        ,(json->lisp (get-in2 :|name| p))
+                        ,acc)
+                acc))
+          (get-in2 :|parameters| path)
+          :initial-value nil))
 
 (defun gen-http-body (root path)
+  "returns a list of :content and a body for http bodies"
   (declare (ignore root))
-  (loop for p in (get-in '(:|parameters|) path)
-        do (if (string= "body" (get-in '(:|in|) p))
-               (return `(:content (cl-json:encode-json-to-string (to-json ,(json->lisp (get-in '(:|name|) p)))))))))
+  (loop for p in (get-in2 :|parameters| path) do
+    (if (string= "body" (get-in2 :|in| p))
+        (return `(:content (cl-json:encode-json-to-string (to-json ,(json->lisp (get-in2 :|name| p)))))))))
 
 (defun gen-http-options (root path)
+  "for inclusion in the final http request"
   `(:parameters ,(gen-http-params root path)
     ,@(gen-http-body root path)
     :additional-headers ,(gen-http-headers root path)
     :want-stream t))
 
 (defun sym-to-integer (x)
+  "returns the integer from the symbol, ie: :|200| -> 200"
   (parse-integer (string x)))
 
+(defun model-json-name (model-name)
+  (json->lisp (format nil "~A-FROM-JSON" model-name)))
+
+(defun schema->model (value)
+  (car (last (cl-ppcre:split "/" (or (get-in2 (:|schema| :|items| :|$ref|) value)
+                                     (get-in2 (:|schema| :|$ref|) value))))))
+
 (defun make-response (root value)
+  "how to generate the response from path"
   (declare (ignore root))
-  (let ((type (get-in '(:|schema| :|type|) value)))
+  (let* ((type (get-in2 (:|schema| :|type|) value))
+         (model-name (schema->model value))
+         (from-json (model-json-name model-name)))
     (cond
-      ((string= "array" type) (let ((model-name (car (last (cl-ppcre:split "/" (get-in '(:|schema| :|items| :|$ref|) value))))))
-                `(loop for item in json
-                       collect (,(json->lisp (format nil "~A-FROM-JSON" model-name)) item))))
-      ((string= "object" type)
-       'json)
-      ((get-in '(:|schema| :|$ref|) value)
-       (let ((model-name (car (last (cl-ppcre:split "/" (get-in '(:|schema| :|$ref|) value))))))
-         `(,(json->lisp (format nil "~A-FROM-JSON" model-name)) json)))
-      (t (get-in '(:|description|) value)))))
+      ((string= "array" type)
+       `(mapcar (lambda (item) (,from-json item)) json))
+      ((string= "object" type) 'json)
+      ((get-in2 (:|schema| :|$ref|) value) `(,from-json json))
+      (t (get-in2 :|description| value)))))
 
 (defun prop->slot (x)
+  "property to slot name"
   (json->lisp (string (car x))))
 
 (defun prop->accessor (prop class-name)
+  "property to slot accessor"
   (json->lisp (format nil "~A-~A" class-name (car prop))))
 
 (defun gen-slot (root class-name prop)
+  "generates a slot definition from the property"
   (declare (ignore root))
   (let ((sym-name (prop->slot prop)))
     `(,sym-name
       :initarg ,(json->lisp (string sym-name) :keyword t)
-      ,@(list :type (switch ((get-in '(:|type|) (cdr prop)) :test #'equal)
+      ,@(list :type (switch ((get-in2 :|type| (cdr prop)) :test #'equal)
                       ("string" 'string)
                       ("array" 'list)
                       ("integer" 'integer)
                       ("object" 'swagger-object)))
-      ,@(if-let ((default (get-in '(:default) (cdr prop))))
+      ,@(if-let ((default (get-in2 :default (cdr prop))))
           `(:initform ,default))
       :accessor ,(prop->accessor prop class-name))))
 
@@ -236,72 +261,71 @@
   (:documentation "returns the swagger properties"))
 
 (defun gen-definiton (root defn)
-  (let ((class-name (json->lisp (car defn))))
+  "generates a class  and methods for the swagger class definition"
+  (let ((class-name (json->lisp (car defn)))
+        (properties (get-in2 :|properties| (cdr defn))))
     `((defclass ,class-name (swagger:swagger-object)
-        ,(mapcar (lambda (x)
-                   (gen-slot root class-name x))
-          (get-in '(:|properties|) (cdr defn)))
-        ,@(if-let ((doc (get-in '(:|description|) (cdr defn))))
-            `(:documentation ,doc)))
+        ,(mapcar (lambda (x) (gen-slot root class-name x)) properties))
+        ,@(if-let ((doc (get-in2 :|description| (cdr defn))))
+            `(:documentation ,doc))
       (defmethod xml-name ((o ,class-name))
-        ,(get-in '(:|xml| :|name|) (cdr defn)))
+        ,(get-in2 (:|xml| :|name|) (cdr defn)))
       (defmethod properties ((o ,class-name))
-        ',(get-in '(:|properties|) (cdr defn)))
+        ',properties)
       (defun ,(json->lisp (format nil "~A-FROM-JSON" class-name)) (alist)
         (make-instance ',class-name
-                       ,@(loop for p in (get-in '(:|properties|) (cdr defn))
-                               append `(,(intern (string (prop->slot p)) "KEYWORD") (get-in '(,(car p)) alist)))))
+                       ,@(mapcan (lambda (p)
+                                   `(,(intern (string (prop->slot p)) :keyword) (get-in '(,(car p)) alist)))
+                                 properties)))
       (defmethod to-json ((k ,class-name))
-        ,(if (string= "object" (get-in '(:|type|) (cdr defn)))
-             (let (result)
-               (loop for p in (get-in '(:|properties|) (cdr defn))
-                     do (setf  result `(acons ,(string (car p))
-                                              (,(prop->accessor p class-name) k)
-                                              ,result)))
-               result))))))
+        ,(switch ((get-in2 :|type| (cdr defn)) :test #'string=)
+           ("object" (reduce (lambda (acc p)
+                               `(acons ,(string (car p))
+                                       (,(prop->accessor p class-name) k)
+                                       ,acc))
+                             properties
+                             :initial-value nil)))))))
 
 (defun gen-error (defn)
+  "generates a condition for the swagger error"
   `(define-condition ,(json->lisp (format nil "~A-ERROR" (string (car defn)))) (error)
-     ,(eswitch ((get-in '(:type) (cdr defn)) :test #'equal)
+     ,(eswitch ((get-in2 :type (cdr defn)) :test #'equal)
         ("array" '((items :initarg :items)))
         ("string" '((what :initarg :what))))))
 
 (defun gen-all-definitions (root)
-  (let (out)
-    (loop for defn in (get-in '(:|definitions|) root)
-          do (let ((d
-                     (if (equal :+JSON+-ERRORS (car defn))
-                         (loop for error in (get-in '(:|properties|) (cdr defn))
-                               do (gen-error error))
-                         (gen-definiton root defn))))
-               (setf out (append out d))))
-    out))
+  "loops over all definitions"
+  (loop for defn in (get-in2 :|definitions| root)
+        append (gen-definiton root defn)))
 
 (defun gen-all-paths (root)
-  (mapcan (lambda (path)
-            (mapcar (lambda (verb)
-                      (gen-path-func root (car path) verb))
-                    (cdr path)))
-          (get-in '(:|paths|) root)))
+  (loop for path in (get-in2 :|paths| root)
+        append (mapcar
+                (lambda (verb)
+                  (gen-path-func root (car path) verb))
+                (remove nil (mapcar (lambda (x)
+                                      (assoc x (cdr path)))
+                                    '(:|get| :|put| :|post| :|delete|
+                                      :|options| :|head| :|patch|))))))
 
 (defun gen-path-func (root path verb)
-  `(defun ,(json->lisp (get-in '(:|operationId|) (cdr verb)))
-       ,(gen-parameters  root (get-in '(:|parameters|) (cdr verb)))
-     ,(get-in '(:|description|) (cdr verb))
+  `(defun ,(if-let ( (x (json->lisp (get-in2 :|operationId| (cdr verb)))) )
+             x
+             (break))
+       ,(gen-parameters root (get-in2 :|parameters| (cdr verb)))
+     ,(get-in2 :|description| (cdr verb))
      (multiple-value-bind (body-stream response-code headers)
          (http-request ,(gen-url root path verb) ,@(gen-http-options root (cdr verb))
                        :method ,(json->lisp (car verb) :keyword t))
        (setf (flex:flexi-stream-external-format body-stream) :utf-8)
-       ;; (format t "response_code: ~A" response-code)
-       ;; (pprint headers)
-       (unless (string= (get-in '(:content-type) headers)
+       (unless (string= (get-in2 :content-type headers)
                         "application/json")
          (error 'swagger:unknown-response-content-type-error
-                :content-type (get-in '("Content-Type") headers)))
+                :content-type (cdr (assoc "Content-Type" headers))))
        (let ((json (decode-json body-stream)))
          (pprint json)
          (case response-code
-           ,@(loop for (resp . data) in (get-in '(:|responses|) (cdr verb))
+           ,@(loop for (resp . data) in (get-in2 :|responses| (cdr verb))
                    collect (list (if (equal :|default| resp)
                                      'otherwise
                                      (sym-to-integer resp))
@@ -310,16 +334,17 @@
 (define-condition package-not-found-error (error)
   ((package :initarg :package)))
 
-(defmacro generate-client (package url)
-  (let* ((json (fetch-json url))
-         (old-package (package-name *package*))
+(defun generate-client (package json)
+  (let* ((old-package (package-name *package*))
          (new-pkg (find-package package))
+         (*target-package* new-pkg)
          out)
   (unless new-pkg
     (error 'package-not-found-error :package package))
     (setf *package* new-pkg)
     (unwind-protect
          (setf out `(progn
+                      (defvar *api-host*)
                       ,@(gen-all-definitions json)
                       ,@(gen-all-paths json))))
     (setf *package* (find-package old-package))
